@@ -209,11 +209,16 @@ def run_model(model, loss_fn, d, device='cuda:0', sw=None):
 
     lrtlist_cam0_g = lrtlist_cam0
 
-    _, feat_bev_e, seg_bev_e, center_bev_e, offset_bev_e = model(
+    # _, feat_bev_e, seg_bev_e, center_bev_e, offset_bev_e = model(
+    #         rgb_camXs=rgb_camXs,
+    #         pix_T_cams=pix_T_cams,
+    #         cam0_T_camXs=cam0_T_camXs,
+    #         vox_util=vox_util,
+    #         rad_occ_mem0=in_occ_mem0)
+    _, feat_bev_e, seg_bev_e, center_bev_e, offset_bev_e = model( #NEW
             rgb_camXs=rgb_camXs,
             pix_T_cams=pix_T_cams,
             cam0_T_camXs=cam0_T_camXs,
-            vox_util=vox_util,
             rad_occ_mem0=in_occ_mem0)
 
     ce_loss = loss_fn(seg_bev_e, seg_bev_g, valid_bev_g)
@@ -269,6 +274,101 @@ def run_model(model, loss_fn, d, device='cuda:0', sw=None):
 
     return total_loss, metrics
     
+def export_onnx(model_path, onnx_path, input_shape, device, ignore_load=None, device_ids=[0]):
+    """
+    Exports a PyTorch model to ONNX format.
+
+    Args:
+        model_path (str): Path to the saved PyTorch model checkpoint.
+        onnx_path (str): Path to save the ONNX model.
+        input_shape (tuple): Shape of the input tensor (e.g., (1, 3, 224, 224)).
+        device (str): Device to use (e.g., 'cuda:0' or 'cpu').
+    """
+    print("export_onnx")
+    Z, Y, X = 200, 8, 200
+    use_radar=False
+    use_lidar=False
+    use_metaradar=False
+    do_rgbcompress=True
+    encoder_type='res101'
+    rand_flip=False
+
+    print("vox_util")
+    vox_util = utils.vox.Vox_util(
+        Z, Y, X,
+        scene_centroid=scene_centroid.to(device),
+        bounds=bounds,
+        assert_cube=False)
+
+    print("export_onnx vox_util", vox_util)
+    # model = Segnet(Z, Y, X, vox_util, use_radar=use_radar, use_lidar=use_lidar, use_metaradar=use_metaradar, do_rgbcompress=do_rgbcompress, encoder_type=encoder_type, rand_flip=rand_flip)
+    model = Segnet(Z, Y, X, use_radar=use_radar, use_lidar=use_lidar, use_metaradar=use_metaradar, do_rgbcompress=do_rgbcompress, encoder_type=encoder_type, rand_flip=rand_flip)
+    model = model.to(device)
+    model = torch.nn.DataParallel(model, device_ids=device_ids)
+    _ = saverloader.load(model_path, model.module, ignore_load=ignore_load)
+    model.eval()
+
+    # Create dummy inputs for all required arguments
+    print("Create dummy inputs for all required arguments")
+    dummy_rgb_camXs = torch.randn(*input_shape, device=device)
+    dummy_pix_T_cams = torch.randn(input_shape[0], input_shape[1], 4, 4, device=device)  # Example shape, adjust as needed
+    dummy_cam0_T_camXs = torch.randn(input_shape[0], input_shape[1], 4, 4, device=device)  # Example shape, adjust as needed
+    dummy_rad_occ_mem0 = torch.randn(input_shape[0], Z, Y, X, device=device) if use_radar or use_lidar else None # Example shape, adjust as needed
+
+    print("dummy_rgb_camXs shape= ", dummy_rgb_camXs.shape)
+    print("dummy_pix_T_cams shape= ", dummy_pix_T_cams.shape)
+    print("dummy_cam0_T_camXs shape= ", dummy_cam0_T_camXs.shape)
+    print("dummy_rad_occ_mem0 shape= ", dummy_rad_occ_mem0.shape) if use_radar or use_lidar else print("dummy_rad_occ_mem0 is None")
+
+    # Create a dictionary of dummy inputs
+    print("Create a dictionary of dummy inputs")
+    dummy_inputs = {
+        'rgb_camXs': dummy_rgb_camXs,
+        'pix_T_cams': dummy_pix_T_cams,
+        'cam0_T_camXs': dummy_cam0_T_camXs,
+        'rad_occ_mem0': dummy_rad_occ_mem0
+    }
+
+    # Pre-compute the voxelized outputs
+    print("Pre-compute the voxelized outputs")
+    with torch.no_grad():
+        print("inside torch.no_grad()")
+        dummy_xyz_cam0 = torch.randn(input_shape[0], 1000, 3, device=device) # Example shape, adjust as needed
+        dummy_rad_xyz_cam0 = torch.randn(input_shape[0], 1000, 3, device=device) # Example shape, adjust as needed
+        dummy_meta_rad = torch.randn(input_shape[0], 1000, 16, device=device) # Example shape, adjust as needed
+        dummy_occ_mem0 = vox_util.voxelize_xyz(dummy_xyz_cam0, Z, Y, X, assert_cube=False)
+        dummy_rad_occ_mem0 = vox_util.voxelize_xyz(dummy_rad_xyz_cam0, Z, Y, X, assert_cube=False)
+        dummy_metarad_occ_mem0 = vox_util.voxelize_xyz_and_feats(dummy_rad_xyz_cam0, dummy_meta_rad, Z, Y, X, assert_cube=False)
+
+        print("model.module.use_radar = ", model.module.use_radar)
+        print("model.module.use_lidar = ", model.module.use_lidar)
+        print("model.module.use_metaradar = ", model.module.use_metaradar)
+        if not (model.module.use_radar or model.module.use_lidar):
+            print("if not (model.module.use_radar or model.module.use_lidar)")
+            dummy_in_occ_mem0 = None
+        elif model.module.use_lidar:
+            assert(model.module.use_radar==False) # either lidar or radar, not both
+            assert(model.module.use_metaradar==False) # either lidar or radar, not both
+            dummy_in_occ_mem0 = dummy_occ_mem0
+        elif model.module.use_radar and model.module.use_metaradar:
+            dummy_in_occ_mem0 = dummy_metarad_occ_mem0
+        elif model.module.use_radar:
+            dummy_in_occ_mem0 = dummy_rad_occ_mem0
+        elif model.module.use_metaradar:
+            assert(False) # cannot use_metaradar without use_radar
+        
+    print("torch.onnx.export")
+    torch.onnx.export(
+        model.module,  # Your PyTorch model
+        (dummy_rgb_camXs, dummy_pix_T_cams, dummy_cam0_T_camXs, dummy_in_occ_mem0),  # Dummy input tensor
+        onnx_path,  # Path to save the ONNX model
+        export_params=True,  # Store the trained parameter weights inside the model file
+        opset_version=20,  # ONNX opset version (adjust if needed)
+        do_constant_folding=True,  # Optimize constant operations
+        input_names=['rgb_camXs', 'pix_T_cams', 'cam0_T_camXs', 'rad_occ_mem0'],  # Name of the input layer
+        output_names=['raw_feat', 'feat', 'segmentation', 'instance_center', 'instance_offset']
+    )
+
 def main(
         exp_name='eval',
         # val/test
@@ -352,7 +452,8 @@ def main(
 
     # set up model & seg loss
     seg_loss_fn = SimpleLoss(2.13).to(device)
-    model = Segnet(Z, Y, X, vox_util, use_radar=use_radar, use_lidar=use_lidar, use_metaradar=use_metaradar, do_rgbcompress=do_rgbcompress, encoder_type=encoder_type)
+    # model = Segnet(Z, Y, X, vox_util, use_radar=use_radar, use_lidar=use_lidar, use_metaradar=use_metaradar, do_rgbcompress=do_rgbcompress, encoder_type=encoder_type)
+    model = Segnet(Z, Y, X, use_radar=use_radar, use_lidar=use_lidar, use_metaradar=use_metaradar, do_rgbcompress=do_rgbcompress, encoder_type=encoder_type)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
     parameters = list(model.parameters())
@@ -364,6 +465,15 @@ def main(
     global_step = 0
     requires_grad(parameters, False)
     model.eval()
+
+    #############################################################################
+    # export onnx
+    print("export onnx")
+    onnx_path = "./onnx/rgb/simple_bev.onnx"
+    input_shape = (1, 6, 3, 224, 400)
+    model_path = "checkpoints/8x5_5e-4_rgb12_22_43_46"
+    export_onnx(model_path, onnx_path, input_shape, device, ignore_load, device_ids)
+    #############################################################################
 
     # logging pools. pool size should be larger than max_iters
     n_pool = 10000

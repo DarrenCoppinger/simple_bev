@@ -286,7 +286,15 @@ class Encoder_eff(nn.Module):
         return x
 
 class Segnet(nn.Module):
-    def __init__(self, Z, Y, X, vox_util=None, 
+    # def __init__(self, Z, Y, X, vox_util=None, 
+    #              use_radar=False,
+    #              use_lidar=False,
+    #              use_metaradar=False,
+    #              do_rgbcompress=True,
+    #              rand_flip=False,
+    #              latent_dim=128,
+    #              encoder_type="res101"):
+    def __init__(self, Z, Y, X,
                  use_radar=False,
                  use_lidar=False,
                  use_metaradar=False,
@@ -366,13 +374,47 @@ class Segnet(nn.Module):
             
         # set_bn_momentum(self, 0.1)
 
-        if vox_util is not None:
+        #================================================================================# 
+        # vox_util
+        scene_centroid_x = 0.0
+        scene_centroid_y = 1.0
+        scene_centroid_z = 0.0
+
+        scene_centroid_py = np.array([scene_centroid_x,
+                                    scene_centroid_y,
+                                    scene_centroid_z]).reshape([1, 3])
+        
+        scene_centroid = torch.from_numpy(scene_centroid_py).float()
+
+        # Z, Y, X = 200, 8, 200
+        XMIN, XMAX = -50, 50
+        ZMIN, ZMAX = -50, 50
+        YMIN, YMAX = -5, 5
+        bounds = (XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX)
+        device='cuda:0'
+        vox_util = utils.vox.Vox_util(
+            Z, Y, X,
+            scene_centroid=scene_centroid.to(device),
+            bounds=bounds,
+            assert_cube=False)
+        self.vox_util = vox_util
+
+        if self.vox_util is not None:
             self.xyz_memA = utils.basic.gridcloud3d(1, Z, Y, X, norm=False)
-            self.xyz_camA = vox_util.Mem2Ref(self.xyz_memA, Z, Y, X, assert_cube=False)
+            self.xyz_camA = self.vox_util.Mem2Ref(self.xyz_memA, Z, Y, X, assert_cube=False)
         else:
             self.xyz_camA = None
-        
-    def forward(self, rgb_camXs, pix_T_cams, cam0_T_camXs, vox_util, rad_occ_mem0=None):
+
+        #================================================================================#
+
+        # if vox_util is not None:
+        #     self.xyz_memA = utils.basic.gridcloud3d(1, Z, Y, X, norm=False)
+        #     self.xyz_camA = vox_util.Mem2Ref(self.xyz_memA, Z, Y, X, assert_cube=False)
+        # else:
+        #     self.xyz_camA = None
+
+
+    def forward(self, rgb_camXs, pix_T_cams, cam0_T_camXs, rad_occ_mem0=None):
         '''
         B = batch size, S = number of cameras, C = 3, H = img height, W = img width
         rgb_camXs: (B,S,C,H,W)
@@ -386,6 +428,8 @@ class Segnet(nn.Module):
             - (B, 1, Z, Y, X) when use_lidar = True
         '''
         B, S, C, H, W = rgb_camXs.shape
+        # B = 1
+        # B, S, C, H, W = rgb_camXs.shape # NEW
         assert(C==3)
         # reshape tensors
         __p = lambda x: utils.basic.pack_seqdim(x, B)
@@ -417,7 +461,8 @@ class Segnet(nn.Module):
             xyz_camA = self.xyz_camA.to(feat_camXs_.device).repeat(B*S,1,1)
         else:
             xyz_camA = None
-        feat_mems_ = vox_util.unproject_image_to_mem(
+        # feat_mems_ = vox_util.unproject_image_to_mem(
+        feat_mems_ = self.vox_util.unproject_image_to_mem( #NEW
             feat_camXs_,
             utils.basic.matmul2(featpix_T_cams_, camXs_T_cam0_),
             camXs_T_cam0_, Z, Y, X,
